@@ -63,7 +63,7 @@ const (
 )
 
 // Kind contains the schema.GroupVersionKind for this controller type.
-var Kind = sednav1.SchemeGroupVersion.WithKind(Name)
+var Kind = sednav1.SchemeGroupVersion.WithKind(KindName)
 
 // Controller ensures that all ObjectSearchService objects
 // have corresponding pods to run their configured workload.
@@ -356,7 +356,7 @@ func (c *Controller) sync(key string) (bool, error) {
 	// neededPodCounts indicates the num of tracking worker pods should be created successfully in a objectsearch service currently.
 	// neededDeploymentCounts indicates the num of deployments should be created successfully in a objectsearch service currently,
 	// and one deployment is for userWorker and the other deployment is for reidWorkers.
-	var neededPodCounts int32 = int32(len(service.Spec.TrackingWorkers))
+	var neededPodCounts = int32(len(service.Spec.TrackingWorkers))
 	var neededDeploymentCounts int32 = 2
 
 	activePods := runtime.CalcActivePodCount(pods)
@@ -501,7 +501,7 @@ func (c *Controller) createWorkers(service *sednav1.ObjectSearchService) (active
 	// create reid worker deployment
 	var reidWorkerParam runtime.WorkerParam
 	reidWorkerParam.WorkerType = objectSearchReidWorker
-	_, err = runtime.CreateDeploymentWithTemplate(c.kubeClient, service, &service.Spec.ReidWorkers.DeploymentSpec, &reidWorkerParam, reidServicePort)
+	_, err = runtime.CreateDeploymentWithTemplate(c.kubeClient, service, &service.Spec.ReidWorkers.DeploymentSpec, &reidWorkerParam)
 	if err != nil {
 		return activePods, activeDeployments, fmt.Errorf("failed to create reid worker deployment: %w", err)
 	}
@@ -528,7 +528,7 @@ func (c *Controller) createWorkers(service *sednav1.ObjectSearchService) (active
 		"SERVICE_NAME": service.Name,
 		"WORKER_NAME":  "userworker-" + utilrand.String(5),
 	}
-	_, err = runtime.CreateDeploymentWithTemplate(c.kubeClient, service, userWorkerDeployment, &userWorkerParam, userWorkerPort)
+	_, err = runtime.CreateDeploymentWithTemplate(c.kubeClient, service, userWorkerDeployment, &userWorkerParam)
 
 	if err != nil {
 		return activePods, activeDeployments, fmt.Errorf("failed to create user worker: %w", err)

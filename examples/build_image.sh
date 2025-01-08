@@ -57,8 +57,16 @@ fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-IMAGE_TAG=${IMAGE_TAG:-v0.4.0}
+IMAGE_TAG=${IMAGE_TAG:-v0.5.0} 
 EXAMPLE_REPO_PREFIX=${IMAGE_REPO}/sedna-example-
+
+dockerfiles_multiedgeinference=(
+multi-edge-inference-pedestrian-tracking-feature-extraction.Dockerfile
+# multi-edge-inference-pedestrian-tracking-gpu-feature-extraction.Dockerfile
+# multi-edge-inference-pedestrian-tracking-gpu-videoanalytics.Dockerfile
+multi-edge-inference-pedestrian-tracking-reid.Dockerfile
+multi-edge-inference-pedestrian-tracking-videoanalytics.Dockerfile
+)
 
 dockerfiles_federated_learning=(
 federated-learning-mistnet-yolo-aggregator.Dockerfile
@@ -83,7 +91,8 @@ incremental-learning-helmet-detection.Dockerfile
 # Iterate over the input folders and build them sequentially.
 for tp in ${type[@]}; do
    if [[ "$tp" == "all" ]]; then
-      dockerfiles+=( 
+      dockerfiles+=(
+         "${dockerfiles_multiedgeinference[@]}"
          "${dockerfiles_federated_learning[@]}"
          "${dockerfiles_joint_inference[@]}"
          "${dockerfiles_lifelong_learning[@]}"
@@ -100,5 +109,5 @@ dockerfiles=($(echo "${dockerfiles[@]}" | tr ' ' '\n' | sort -u))
 for dockerfile in ${dockerfiles[@]}; do
    echo "Building $dockerfile" 
    example_name=${dockerfile/.Dockerfile}
-   docker build -f $dockerfile -t ${IMAGE_REPO}/${example_name}:${IMAGE_TAG} --label sedna=examples ..
+   docker build -f $dockerfile -t ${EXAMPLE_REPO_PREFIX}${example_name}:${IMAGE_TAG} --label sedna=examples ..
 done

@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+*.DS_Store
 
 # Test binary, built with `go test -c`
 *.test
@@ -28,3 +29,8 @@ __pycache__/
 
 # go build output
 /_output
+
+# AI model files
+*.pth
+*.model
+*.pkl

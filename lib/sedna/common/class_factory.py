@@ -31,10 +31,16 @@ class ClassType:
     FL_AGG = 'aggregation'
     MTL = 'multi_task_learening'
     UTD = 'unseen_task_detect'
+    OF = 'optical_flow'
 
     ALGORITHM = 'algorithm'
     DATASET = 'data_process'
     CALLBACK = 'post_process_callback'
+
+    # TODO
+    UTP = 'unseen_task_processing'
+    KM = 'knowledge_management'
+    STP = 'seen_task_processing'
 
 
 class ClassFactory(object):

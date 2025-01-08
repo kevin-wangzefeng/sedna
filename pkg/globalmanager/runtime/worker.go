@@ -42,6 +42,8 @@ type WorkerParam struct {
 	ModelHotUpdate ModelHotUpdate
 
 	RestartPolicy v1.RestartPolicy
+
+	DNSPolicy v1.DNSPolicy
 }
 
 type ModelHotUpdate struct {
@@ -83,6 +85,48 @@ func GenerateWorkerSelector(object CommonInterface, workerType string) (labels.S
 	return metav1.LabelSelectorAsSelector(ls)
 }
 
+// CreateKubernetesService creates a k8s service for an object given ip and port
+func CreateKubernetesService(kubeClient kubernetes.Interface, object CommonInterface, workerType string, inputPort int32, inputIP string) (int32, error) {
+	ctx := context.Background()
+	name := object.GetName()
+	namespace := object.GetNamespace()
+	kind := object.GroupVersionKind().Kind
+	targePort := intstr.IntOrString{
+		IntVal: inputPort,
+	}
+	serviceSpec := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: object.GetNamespace(),
+			Name:      strings.ToLower(name + "-" + workerType),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(object, object.GroupVersionKind()),
+			},
+			Labels: generateLabels(object, workerType),
+		},
+		Spec: v1.ServiceSpec{
+			Selector: generateLabels(object, workerType),
+			ExternalIPs: []string{
+				inputIP,
+			},
+			Type: v1.ServiceTypeNodePort,
+			Ports: []v1.ServicePort{
+				{
+					Port:       inputPort,
+					TargetPort: targePort,
+				},
+			},
+		},
+	}
+	service, err := kubeClient.CoreV1().Services(namespace).Create(ctx, serviceSpec, metav1.CreateOptions{})
+	if err != nil {
+		klog.Warningf("failed to create service for %v %v/%v, err:%s", kind, namespace, name, err)
+		return 0, err
+	}
+
+	klog.V(2).Infof("Service %s is created successfully for %v %v/%v", service.Name, kind, namespace, name)
+	return service.Spec.Ports[0].NodePort, nil
+}
+
 // injectWorkerParam modifies pod in-place
 func injectWorkerParam(pod *v1.Pod, workerParam *WorkerParam, object CommonInterface) {
 	InjectStorageInitializer(pod, workerParam)
@@ -120,6 +164,10 @@ func injectWorkerParam(pod *v1.Pod, workerParam *WorkerParam, object CommonInter
 
 	if pod.Spec.RestartPolicy == "" {
 		pod.Spec.RestartPolicy = workerParam.RestartPolicy
+	}
+
+	if workerParam.DNSPolicy != "" {
+		pod.Spec.DNSPolicy = workerParam.DNSPolicy
 	}
 }
 
@@ -164,8 +212,7 @@ func CreateEdgeMeshService(kubeClient kubernetes.Interface, object CommonInterfa
 				{
 					// TODO: be clean, Port.Name is currently required by edgemesh(v1.8.0).
 					// and should be <protocol>-<suffix>
-					Name: "tcp-0",
-
+					Name:       "tcp-0",
 					Protocol:   "TCP",
 					Port:       servicePort,
 					TargetPort: targetPort,
@@ -184,11 +231,13 @@ func CreateEdgeMeshService(kubeClient kubernetes.Interface, object CommonInterfa
 }
 
 // CreateDeploymentWithTemplate creates and returns a deployment object given a crd object, deployment template
-func CreateDeploymentWithTemplate(client kubernetes.Interface, object CommonInterface, spec *appsv1.DeploymentSpec, workerParam *WorkerParam, port int32) (*appsv1.Deployment, error) {
+func CreateDeploymentWithTemplate(client kubernetes.Interface, object CommonInterface, spec *appsv1.DeploymentSpec, workerParam *WorkerParam) (*appsv1.Deployment, error) {
 	objectKind := object.GroupVersionKind()
 	objectName := object.GetNamespace() + "/" + object.GetName()
 	deployment := newDeployment(object, spec, workerParam)
-	injectDeploymentParam(deployment, workerParam, object, port)
+
+	injectDeploymentParam(deployment, workerParam, object)
+
 	createdDeployment, err := client.AppsV1().Deployments(object.GetNamespace()).Create(context.TODO(), deployment, metav1.CreateOptions{})
 	if err != nil {
 		klog.Warningf("failed to create deployment for %s %s, err:%s", objectKind, objectName, err)
@@ -198,14 +247,33 @@ func CreateDeploymentWithTemplate(client kubernetes.Interface, object CommonInte
 	return createdDeployment, nil
 }
 
+// UpdateDeploymentWithTemplate updates an existing deployment object given a crd object, deployment template, and worker parameters
+func UpdateDeploymentWithTemplate(client kubernetes.Interface, object CommonInterface, newDeployment *appsv1.Deployment, workerParam *WorkerParam) (*appsv1.Deployment, error) {
+	objectKind := object.GroupVersionKind()
+	objectName := object.GetNamespace() + "/" + object.GetName()
+
+	// Inject worker parameters.
+	injectDeploymentParam(newDeployment, workerParam, object)
+
+	// Call the Kubernetes API to perform the update.
+	updatedDeployment, err := client.AppsV1().Deployments(newDeployment.Namespace).Update(context.TODO(), newDeployment, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Warningf("failed to update deployment for %s %s, err: %s", objectKind, objectName, err)
+		return nil, fmt.Errorf("failed to update deployment: %w", err)
+	}
+
+	klog.V(2).Infof("deployment %s is updated successfully for %s %s", updatedDeployment.Name, objectKind, objectName)
+	return updatedDeployment, nil
+}
+
 func newDeployment(object CommonInterface, spec *appsv1.DeploymentSpec, workerParam *WorkerParam) *appsv1.Deployment {
 	nameSpace := object.GetNamespace()
-	deploymentName := object.GetName() + "-" + "deployment" + "-" + strings.ToLower(workerParam.WorkerType) + "-"
+	deploymentName := object.GetName() + "-" + "deployment" + "-" + strings.ToLower(workerParam.WorkerType)
 	matchLabel := make(map[string]string)
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: deploymentName,
-			Namespace:    nameSpace,
+			Name:      deploymentName,
+			Namespace: nameSpace,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(object, object.GroupVersionKind()),
 			},
@@ -221,7 +289,16 @@ func newDeployment(object CommonInterface, spec *appsv1.DeploymentSpec, workerPa
 }
 
 // injectDeploymentParam modifies deployment in-place
-func injectDeploymentParam(deployment *appsv1.Deployment, workerParam *WorkerParam, object CommonInterface, port int32) {
+func injectDeploymentParam(deployment *appsv1.Deployment, workerParam *WorkerParam, object CommonInterface) {
+	var appLabelKey = "app.sedna.io"
+	var appLabelValue = object.GetName() + "-" + workerParam.WorkerType + "-" + "svc"
+
+	// Injection of the storage variables must be done before loading
+	// the environment variables!
+	if workerParam.Mounts != nil {
+		InjectStorageInitializerDeployment(deployment, workerParam)
+	}
+
 	// inject our labels
 	if deployment.Labels == nil {
 		deployment.Labels = make(map[string]string)
@@ -229,16 +306,27 @@ func injectDeploymentParam(deployment *appsv1.Deployment, workerParam *WorkerPar
 	if deployment.Spec.Template.Labels == nil {
 		deployment.Spec.Template.Labels = make(map[string]string)
 	}
+	if deployment.Spec.Selector.MatchLabels == nil {
+		deployment.Spec.Selector.MatchLabels = make(map[string]string)
+	}
 
 	for k, v := range generateLabels(object, workerParam.WorkerType) {
 		deployment.Labels[k] = v
 		deployment.Spec.Template.Labels[k] = v
 		deployment.Spec.Selector.MatchLabels[k] = v
 	}
-	deployment.Spec.Template.Spec.Containers[0].Ports = []v1.ContainerPort{
-		{
-			ContainerPort: port,
-		},
+
+	// Edgemesh part, useful for service mapping (not necessary!)
+	deployment.Labels[appLabelKey] = appLabelValue
+	deployment.Spec.Template.Labels[appLabelKey] = appLabelValue
+	deployment.Spec.Selector.MatchLabels[appLabelKey] = appLabelValue
+
+	// Env variables injection
+	envs := createEnvVars(workerParam.Env)
+	for idx := range deployment.Spec.Template.Spec.Containers {
+		deployment.Spec.Template.Spec.Containers[idx].Env = append(
+			deployment.Spec.Template.Spec.Containers[idx].Env, envs...,
+		)
 	}
 }
 

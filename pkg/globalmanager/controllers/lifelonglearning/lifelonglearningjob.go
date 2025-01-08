@@ -18,13 +18,16 @@ package lifelonglearning
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -275,11 +278,12 @@ func (c *Controller) sync(key string) (bool, error) {
 	// transit this job's state machine
 	needUpdated, err = c.transitJobState(&job)
 	if err != nil {
-		klog.V(2).Infof("lifelonglearning job %v/%v faied to be updated, err:%s", job.Namespace, job.Name, err)
+		klog.V(2).Infof("lifelonglearning job %v/%v failed to be updated, err:%s", job.Namespace, job.Name, err)
 	}
 
 	if needUpdated {
 		if err := c.updateJobStatus(&job); err != nil {
+			klog.V(4).Infof("the job needUpdated, err is %s", err)
 			return forget, err
 		}
 
@@ -290,8 +294,49 @@ func (c *Controller) sync(key string) (bool, error) {
 
 		forget = true
 	}
-
 	return forget, err
+}
+
+// setWorkerNodeNameOfJob sets the worker nodeName of the specified job
+// which is used for downstream to sync job info to the specified LC located in nodeName.
+func (c *Controller) setWorkerNodeNameOfJob(job *sednav1.LifelongLearningJob, jobStage string, nodeName string) error {
+	klog.V(4).Infof("setWorkerNodeNameOfJob job name is %s, job Stage is %s, nodeName is %s", job.Name, jobStage, nodeName)
+	key := runtime.AnnotationsKeyPrefix + jobStage
+
+	return c.addJobAnnotations(job, key, nodeName)
+}
+
+// addJobAnnotations adds info in job annotations
+func (c *Controller) addJobAnnotations(job *sednav1.LifelongLearningJob, key string, value string) error {
+	ann := job.GetAnnotations()
+	if ann[key] == value {
+		// already set
+		return nil
+	}
+
+	patchData := metav1.PartialObjectMetadata{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{key: value}}}
+
+	patchDataBytes, err := json.Marshal(&patchData)
+	if err != nil {
+		return err
+	}
+
+	jobClient := c.client.LifelongLearningJobs(job.Namespace)
+	return runtime.RetryUpdateStatus(job.Name, job.Namespace, func() error {
+		newJob, err := jobClient.Get(context.TODO(), job.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		annotations := newJob.GetAnnotations()
+		if annotations[key] == value {
+			return nil
+		}
+
+		_, err = jobClient.Patch(context.TODO(), job.Name, types.MergePatchType, patchDataBytes, metav1.PatchOptions{})
+		return err
+	})
 }
 
 // transitJobState transit job to next state
@@ -306,13 +351,15 @@ func (c *Controller) transitJobState(job *sednav1.LifelongLearningJob) (bool, er
 	var needUpdated = false
 
 	var podStatus v1.PodPhase = v1.PodUnknown
+	var pod *v1.Pod
+
 	jobConditions := job.Status.Conditions
 	if len(jobConditions) > 0 {
 		// get latest pod and pod status
 		latestCondition = (jobConditions)[len(jobConditions)-1]
 		klog.V(2).Infof("lifelonglearning job %v/%v latest stage %v:", job.Namespace, job.Name,
 			latestCondition.Stage)
-		pod := c.getSpecifiedPods(job, string(latestCondition.Stage))
+		pod = c.getSpecifiedPods(job, string(latestCondition.Stage))
 
 		if pod != nil {
 			podStatus = pod.Status.Phase
@@ -321,6 +368,8 @@ func (c *Controller) transitJobState(job *sednav1.LifelongLearningJob) (bool, er
 	jobStage := latestCondition.Stage
 	currentType := latestCondition.Type
 	newConditionType = currentType
+
+	//klog.Infof("==== stage is %s, type is %s, name is %s", jobStage, currentType, job.Name)
 
 	switch currentType {
 	case initialType:
@@ -337,25 +386,30 @@ func (c *Controller) transitJobState(job *sednav1.LifelongLearningJob) (bool, er
 			err = c.restartInferPod(job)
 			if err != nil {
 				klog.V(2).Infof("lifelonglearning job %v/%v inference pod failed to restart, err:%s", job.Namespace, job.Name, err)
-			} else {
-				klog.V(2).Infof("lifelonglearning job %v/%v inference pod restarts successfully", job.Namespace, job.Name)
+				return needUpdated, err
 			}
-		} else if podStatus != v1.PodPending && podStatus != v1.PodRunning {
-			err = c.createPod(job, jobStage)
+
+			klog.V(2).Infof("lifelonglearning job %v/%v inference pod restarts successfully", job.Namespace, job.Name)
+			newConditionType = sednav1.LLJobStageCondCompleted
+		} else {
+			if podStatus != v1.PodPending && podStatus != v1.PodRunning {
+				err = c.createPod(job, jobStage)
+				if err != nil {
+					return needUpdated, err
+				}
+			}
+			newConditionType = sednav1.LLJobStageCondStarting
 		}
-		if err != nil {
-			return needUpdated, err
-		}
-		newConditionType = sednav1.LLJobStageCondStarting
 
 	case sednav1.LLJobStageCondStarting, sednav1.LLJobStageCondRunning:
 		if podStatus == v1.PodRunning {
-			if jobStage == sednav1.LLJobDeploy {
-				newConditionType = sednav1.LLJobStageCondCompleted
-			} else {
-				// watch pod status, if pod running, set type running
-				newConditionType = sednav1.LLJobStageCondRunning
+			// add nodeName to job
+			if err := c.setWorkerNodeNameOfJob(job, string(jobStage), pod.Spec.NodeName); err != nil {
+				return needUpdated, err
 			}
+
+			// watch pod status, if pod running, set type running
+			newConditionType = sednav1.LLJobStageCondRunning
 		} else if podStatus == v1.PodSucceeded {
 			// watch pod status, if pod completed, set type completed
 			newConditionType = sednav1.LLJobStageCondCompleted
@@ -492,6 +546,37 @@ func IsJobFinished(j *sednav1.LifelongLearningJob) bool {
 	return false
 }
 
+// isCompletedInitialTraining checks whether job has completed initial train task.
+func (c *Controller) hasCompletedInitialTraining(jobConditions []sednav1.LLJobCondition) bool {
+	for i := 0; i < len(jobConditions); i++ {
+		jobCond := jobConditions[i]
+		if jobCond.Stage == sednav1.LLJobTrain && jobCond.Type == sednav1.LLJobStageCondCompleted {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) getCloudKBIndex(jobConditions []sednav1.LLJobCondition) string {
+	for i := len(jobConditions) - 1; i >= 0; i-- {
+		jobCond := jobConditions[i]
+		var cond ConditionData
+		if jobCond.Stage == sednav1.LLJobTrain && jobCond.Type == sednav1.LLJobStageCondCompleted {
+			if err := (&cond).Unmarshal([]byte(jobCond.Data)); err != nil {
+				continue
+			}
+
+			if cond.Output == nil || len(cond.Output.Models) == 0 {
+				continue
+			}
+
+			model := cond.Output.Models[0]
+			return model.GetURL()
+		}
+	}
+	return ""
+}
+
 func (c *Controller) createPod(job *sednav1.LifelongLearningJob, podtype sednav1.LLJobStage) (err error) {
 	ctx := context.Background()
 	var podTemplate *v1.PodTemplateSpec
@@ -521,8 +606,10 @@ func (c *Controller) createPod(job *sednav1.LifelongLearningJob, podtype sednav1
 		return err
 	}
 
+	jobConditions := job.Status.Conditions
+
 	// get all url for train and eval from data in condition
-	condDataStr := job.Status.Conditions[len(job.Status.Conditions)-1].Data
+	condDataStr := jobConditions[len(job.Status.Conditions)-1].Data
 	klog.V(2).Infof("lifelonglearning job %v/%v data condition:%s", job.Namespace, job.Name, condDataStr)
 	var cond ConditionData
 	(&cond).Unmarshal([]byte(condDataStr))
@@ -548,13 +635,19 @@ func (c *Controller) createPod(job *sednav1.LifelongLearningJob, podtype sednav1
 		podTemplate = &job.Spec.TrainSpec.Template
 		// Env parameters for train
 
-		workerParam.Env = map[string]string{
-			"NAMESPACE":   job.Namespace,
-			"JOB_NAME":    job.Name,
-			"WORKER_NAME": "train-worker-" + utilrand.String(5),
+		hasCompletedInitialTraining := c.hasCompletedInitialTraining(jobConditions)
 
-			"LC_SERVER": c.cfg.LC.Server,
-			"KB_SERVER": c.cfg.KB.Server,
+		workerParam.Env = map[string]string{
+			"NAMESPACE":                      job.Namespace,
+			"JOB_NAME":                       job.Name,
+			"WORKER_NAME":                    "train-worker-" + utilrand.String(5),
+			"HAS_COMPLETED_INITIAL_TRAINING": strconv.FormatBool(hasCompletedInitialTraining),
+			"LC_SERVER":                      c.cfg.LC.Server,
+			"KB_SERVER":                      c.cfg.KB.Server,
+		}
+
+		if hasCompletedInitialTraining {
+			workerParam.Env["CLOUD_KB_INDEX"] = c.getCloudKBIndex(jobConditions)
 		}
 
 		workerParam.Mounts = append(workerParam.Mounts,
@@ -651,6 +744,7 @@ func (c *Controller) createPod(job *sednav1.LifelongLearningJob, podtype sednav1
 	// set the default policy instead of Always policy
 	workerParam.RestartPolicy = v1.RestartPolicyOnFailure
 	workerParam.HostNetwork = true
+	workerParam.DNSPolicy = v1.DNSClusterFirstWithHostNet
 
 	// create pod based on podtype
 	_, err = runtime.CreatePodWithTemplate(c.kubeClient, job, podTemplate, workerParam)
@@ -689,12 +783,13 @@ func (c *Controller) createInferPod(job *sednav1.LifelongLearningJob) error {
 		"NAMESPACE":   job.Namespace,
 		"JOB_NAME":    job.Name,
 		"WORKER_NAME": "inferworker-" + utilrand.String(5),
-
-		"LC_SERVER": c.cfg.LC.Server,
+		"LC_SERVER":   c.cfg.LC.Server,
+		"OUTPUT_URL":  job.Spec.OutputDir,
 	}
 
 	workerParam.WorkerType = runtime.InferencePodType
 	workerParam.HostNetwork = true
+	workerParam.DNSPolicy = v1.DNSClusterFirstWithHostNet
 
 	// create edge pod
 	_, err = runtime.CreatePodWithTemplate(c.kubeClient, job, &job.Spec.DeploySpec.Template, workerParam)
